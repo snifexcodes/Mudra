@@ -1,21 +1,35 @@
-// Results view: renders /api/report (model comparison, confusion matrix, per-sign table).
+// Results view: renders a pack's reports (model comparison, confusion matrix,
+// per-sign table) for its still-sign model and its moving-sign model.
 
 import { esc } from "./translate.js";
 
 const pct = (v, d = 1) => `${(v * 100).toFixed(d)}%`;
+const KIND_NAME = { still: "Still signs", moving: "Moving signs" };
 
-export function renderResults(root, report, { onGoTrain }) {
-  if (!report) {
+export function renderResults(root, reports, { onGoTrain, packName, kind }) {
+  const available = ["still", "moving"].filter((k) => reports && reports[k]);
+  if (!available.length) {
     root.innerHTML = `
       <div class="empty-state">
-        <h2>No model yet</h2>
-        <p>Record at least two signs in the Train tab, then press Train model. The accuracy, the comparison of four models and the confusion matrix will appear here.</p>
+        <h2>No model for ${esc(packName)} yet</h2>
+        <p>Record at least two still signs or two moving signs in the Train tab, then press Train model. The accuracy, the comparison of four models and the confusion matrix will appear here.</p>
         <button class="primary" id="go-train">Go to Train</button>
       </div>`;
     root.querySelector("#go-train").addEventListener("click", onGoTrain);
-    return;
+    return null;
   }
+  const show = available.includes(kind) ? kind : available[0];
+  root.innerHTML = `<div class="kind-switch no-print" role="tablist" aria-label="Model">${available.map((k) =>
+    `<button role="tab" data-kind="${k}" aria-selected="${k === show}">${KIND_NAME[k]}</button>`).join("")}</div><div id="report-body"></div>`;
+  const body = root.querySelector("#report-body");
+  renderReport(body, reports[show], packName, show);
+  root.querySelectorAll("[data-kind]").forEach((b) => b.addEventListener("click", () => {
+    renderResults(root, reports, { onGoTrain, packName, kind: b.dataset.kind });
+  }));
+  return show;
+}
 
+function renderReport(root, report, packName, kind) {
   const r = report;
   const grouped = r.evaluation.method === "grouped";
   const models = [...r.models].filter((m) => !m.error).sort((a, b) => b.macro_f1 - a.macro_f1);
@@ -32,17 +46,17 @@ export function renderResults(root, report, { onGoTrain }) {
   root.innerHTML = `
     <div class="results-head">
       <div>
-        <h2>Model results</h2>
+        <h2>${esc(packName)}: ${KIND_NAME[kind].toLowerCase()}</h2>
         <p>Trained ${esc(r.trained_at)}. ${esc(r.best_model)} scored best and is used for live recognition.</p>
       </div>
       <button class="ghost no-print" id="print-report"><svg><use href="#i-print"/></svg>Print or save as PDF</button>
     </div>
 
     <div class="tiles">
-      <div class="tile hero"><div class="k">Accuracy</div><div class="v">${pct(r.accuracy)}</div><div class="s">${grouped ? "on recordings the model never saw" : "on held-out frames"}</div></div>
+      <div class="tile hero"><div class="k">Accuracy</div><div class="v">${pct(r.accuracy)}</div><div class="s">${grouped ? "on recordings the model never saw" : (kind === "moving" ? "on held-out repetitions" : "on held-out frames")}</div></div>
       <div class="tile"><div class="k">Macro F1</div><div class="v">${pct(r.macro_f1)}</div><div class="s">all signs weighted equally</div></div>
       <div class="tile"><div class="k">Signs</div><div class="v">${r.dataset.signs}</div><div class="s">${r.dataset.two_hand_samples ? `${r.dataset.two_hand_samples} two-hand samples` : "one hand"}</div></div>
-      <div class="tile"><div class="k">Samples</div><div class="v">${r.dataset.samples.toLocaleString()}</div><div class="s">from ${r.dataset.recordings} recordings</div></div>
+      <div class="tile"><div class="k">${kind === "moving" ? "Repetitions" : "Samples"}</div><div class="v">${r.dataset.samples.toLocaleString()}</div><div class="s">from ${r.dataset.recordings} recordings</div></div>
     </div>
 
     <div class="callout"><strong>How this was measured.</strong> ${esc(r.evaluation.text)}</div>

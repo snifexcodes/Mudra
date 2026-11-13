@@ -2,15 +2,15 @@
 Desktop version of Mudra using OpenCV for the camera window.
 
 It uses the same feature code, the same starter rules and the same trained
-model (models/model.joblib) as the web app, so a model trained in the browser
-works here too.
+still-sign model (packs/<pack>/model_still.joblib) as the web app, so a model
+trained in the browser works here too. Moving signs are only in the web app.
 
 Setup (once):
     pip install -r requirements-cv.txt
     python tools/download_assets.py        # gets hand_landmarker.task
 
 Run:
-    python cv_demo.py                      # --camera 1 for another webcam
+    python cv_demo.py --pack isl           # --camera 1 for another webcam
 
 Keys:  q quit   space add a space   backspace delete   c clear   m model/rules
 """
@@ -34,7 +34,7 @@ except ImportError:
 
 from core import features, rules
 from core.assets import ROOT, VENDOR
-from core.model import Recognizer
+from core.packs import DEFAULT_PACK, PackError, PackManager
 
 # finger colours as BGR: thumb, index, middle, ring, little
 HUES = [(71, 181, 255), (89, 122, 255), (139, 79, 255), (255, 107, 183), (255, 140, 91)]
@@ -124,6 +124,7 @@ def put(img, text, org, scale=0.7, color=(240, 240, 240), thick=2):
 def main():
     ap = argparse.ArgumentParser(description="Mudra OpenCV demo")
     ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--pack", default=DEFAULT_PACK, help="sign-language pack: isl, asl, bsl or your own")
     ap.add_argument("--hands", type=int, default=1, choices=(1, 2))
     ap.add_argument("--hold", type=float, default=0.9, help="seconds to hold a sign")
     ap.add_argument("--min-conf", type=float, default=0.7)
@@ -133,9 +134,14 @@ def main():
     if not task.exists():
         sys.exit("Missing hand_landmarker.task. Run: python tools/download_assets.py")
 
-    recognizer = Recognizer(ROOT / "models")
+    try:
+        pack = PackManager(ROOT / "packs", legacy_root=ROOT).get(args.pack)
+    except PackError as exc:
+        sys.exit(str(exc))
+    recognizer = pack.still
+    allowed = set(pack.starter_labels())
     use_model = recognizer.ready
-    print("Using", f"trained model ({recognizer.info()['name']})" if use_model else "starter gestures")
+    print(pack.meta.get("name"), "-", f"trained model ({recognizer.info()['name']})" if use_model else "starter gestures")
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_tasks.BaseOptions(model_asset_path=str(task)),
@@ -179,9 +185,16 @@ def main():
         if hands:
             absent_since = None
             vec, measures = features.extract(hands)
-            pred = recognizer.predict(vec) if use_model else rules.predict(measures)
+            if use_model:
+                pred = recognizer.predict(vec)
+            elif allowed:
+                pred = rules.predict(measures, allowed=allowed)
+            else:
+                pred = {"label": None, "confidence": 0.0}
             conf = pred["confidence"]
             shown, progress, added = holder.update(now, pred["label"], conf)
+            if added == "NO SIGN":
+                added = None
             for hand in hands:
                 pts = [(int(w - x), int(y)) for x, y, _ in hand["lm"]]
                 draw_hand(view, pts)

@@ -7,6 +7,10 @@ later and the model can simply be retrained from the same recordings.
 Each line:
     {"label": "HELLO", "session": "a1b2c3", "ts": 1731500000.0, "hands": [...]}
 
+Moving signs are stored one clip (one repetition) per line:
+    {"label": "THANK YOU", "session": "...", "ts": ..., "kind": "clip",
+     "frames": [{"t": 0.0, "hands": [...], "pose": [[x, y, z], ...]}, ...]}
+
 A "session" is one press of the Record button. Frames from the same session
 look almost identical, so the evaluation keeps whole sessions together when
 it splits train and test data (see model.py).
@@ -36,6 +40,22 @@ def clean_label(label: str) -> str:
     return text
 
 
+def _slim_hand(h: dict) -> dict:
+    return {
+        "handed": h.get("handed", "Right"),
+        "lm": [[round(float(v), 2) for v in p] for p in h["lm"]],
+        "wlm": [[round(float(v), 5) for v in p] for p in (h.get("wlm") or h["lm"])],
+    }
+
+
+def _slim_pose(pose):
+    try:
+        pts = [[round(float(v), 1) for v in p[:3]] for p in pose[:3]]
+        return pts if len(pts) == 3 else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def _valid_hand(hand) -> bool:
     try:
         pts = hand.get("wlm") or hand.get("lm")
@@ -58,15 +78,59 @@ class Dataset:
             hands = [h for h in (frame or {}).get("hands", []) if _valid_hand(h)]
             if not hands:
                 continue
-            slim = [
-                {
-                    "handed": h.get("handed", "Right"),
-                    "lm": [[round(float(v), 2) for v in p] for p in h["lm"]],
-                    "wlm": [[round(float(v), 5) for v in p] for p in (h.get("wlm") or h["lm"])],
-                }
-                for h in hands[:2]
-            ]
+            slim = [_slim_hand(h) for h in hands[:2]]
             lines.append(json.dumps({"label": label, "session": session, "ts": now, "hands": slim}))
+        if lines:
+            with _lock, self.path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        return len(lines)
+
+    def add_clips(self, label: str, session: str, clips: list[list[dict]], min_frames: int = 3,
+                  source: str | None = None) -> int:
+        """Each clip is a list of frames {t, hands, pose}. Returns how many clips were kept.
+
+        `source` (optional) records where an imported clip came from, so importers can skip it next time.
+        """
+        label = clean_label(label)
+        session = re.sub(r"[^A-Za-z0-9_-]", "", str(session or ""))[:40] or f"s{int(time.time() * 1000)}"
+        lines = []
+        now = time.time()
+        for clip in clips or []:
+            frames = []
+            for f in clip or []:
+                hands = [h for h in (f or {}).get("hands", []) if _valid_hand(h)]
+                if not hands:
+                    continue
+                try:
+                    t = round(float(f.get("t", 0.0)), 3)
+                except (TypeError, ValueError):
+                    continue
+                frames.append({"t": t, "hands": [_slim_hand(h) for h in hands[:2]], "pose": _slim_pose(f.get("pose"))})
+            if len(frames) >= min_frames:
+                rec = {"label": label, "session": session, "ts": now, "kind": "clip", "frames": frames}
+                if source:
+                    rec["source"] = str(source)[:120]
+                lines.append(json.dumps(rec))
+        if lines:
+            with _lock, self.path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        return len(lines)
+
+    def append_records(self, records: list[dict]) -> int:
+        """Adds already-formatted records (pack import). Skips sessions that are already here."""
+        have = {r["session"] for r in self.load()}
+        lines = []
+        for r in records:
+            if not isinstance(r, dict) or r.get("session") in have:
+                continue
+            try:
+                label = clean_label(r.get("label"))
+            except ValueError:
+                continue
+            if r.get("kind") == "clip" and isinstance(r.get("frames"), list):
+                lines.append(json.dumps({**r, "label": label}))
+            elif isinstance(r.get("hands"), list) and r["hands"] and all(_valid_hand(h) for h in r["hands"]):
+                lines.append(json.dumps({**r, "label": label}))
         if lines:
             with _lock, self.path.open("a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -85,25 +149,27 @@ class Dataset:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("label") and rec.get("hands"):
+                if rec.get("label") and rec.get("session") and (rec.get("hands") or rec.get("frames")):
                     out.append(rec)
         return out
 
     def summary(self) -> dict:
         counts: dict[str, int] = defaultdict(int)
         sessions: dict[str, list[str]] = defaultdict(list)
+        kinds: dict[str, str] = {}
         last_session = None
         last_ts = -1.0
         for rec in self.load():
             label = rec["label"]
             counts[label] += 1
+            kinds[label] = "moving" if rec.get("kind") == "clip" else "still"
             if rec["session"] not in sessions[label]:
                 sessions[label].append(rec["session"])
             if rec.get("ts", 0) >= last_ts:
                 last_ts = rec.get("ts", 0)
                 last_session = {"label": label, "session": rec["session"]}
         signs = [
-            {"label": k, "samples": counts[k], "sessions": len(sessions[k])}
+            {"label": k, "samples": counts[k], "sessions": len(sessions[k]), "kind": kinds[k]}
             for k in sorted(counts)
         ]
         return {

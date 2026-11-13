@@ -1,0 +1,4 @@
+# For the dataset importers in tools/datasets/
+-r requirements-cv.txt
+pandas>=2.0
+pyarrow>=14

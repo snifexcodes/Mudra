@@ -12,6 +12,10 @@ recording it has never seen. If a sign has only one recording, that is not
 possible and the report says the accuracy is likely optimistic.
 
 The model with the best macro F1 score is retrained on all data and saved.
+
+Each sign-language pack has two models: "still" for hand shapes held still
+(one frame, see features.py) and "moving" for signs that move (a short clip,
+see sequence.py). Both go through the same comparison and evaluation.
 """
 
 from __future__ import annotations
@@ -35,13 +39,18 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
-from . import features, rules
+from . import features, rules, sequence
 
-MIN_SAMPLES_PER_SIGN = 20
+MIN_SAMPLES_PER_SIGN = 20      # frames per still sign
+MIN_CLIPS_PER_SIGN = 5         # repetitions per moving sign
 MIN_SIGNS = 2
+KINDS = ("still", "moving")
 
 
-def candidates() -> dict:
+def candidates(n_samples: int = 10_000, n_classes: int = 2) -> dict:
+    # MLP early stopping holds out 10% for validation; with very little data
+    # that hold-out can't contain every class, so it is switched off.
+    early = n_samples >= 15 * n_classes
     return {
         "k-Nearest Neighbours": make_pipeline(
             StandardScaler(), KNeighborsClassifier(n_neighbors=5, weights="distance")
@@ -56,7 +65,7 @@ def candidates() -> dict:
         "Neural network (MLP)": make_pipeline(
             StandardScaler(),
             MLPClassifier(hidden_layer_sizes=(128, 64), alpha=1e-3, max_iter=400,
-                          early_stopping=True, n_iter_no_change=15, random_state=42),
+                          early_stopping=early, n_iter_no_change=15, random_state=42),
         ),
     }
 
@@ -65,12 +74,18 @@ class TrainingError(Exception):
     pass
 
 
-def build_matrix(records: list[dict]):
+def build_matrix(records: list[dict], kind: str = "still"):
     X, y, groups, measures = [], [], [], []
     skipped = 0
     for rec in records:
+        is_clip = rec.get("kind") == "clip"
+        if (kind == "moving") != is_clip:
+            continue
         try:
-            vec, ms = features.extract(rec["hands"])
+            if kind == "moving":
+                vec, ms = sequence.clip_features(rec["frames"]), None
+            else:
+                vec, ms = features.extract(rec["hands"])
         except (ValueError, KeyError, TypeError):
             skipped += 1
             continue
@@ -89,22 +104,24 @@ def _latency_ms(est, x_one: np.ndarray, repeats: int = 30) -> float:
     return (time.perf_counter() - t0) / repeats * 1000.0
 
 
-def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict, dict]:
+def train(records: list[dict], progress=lambda stage, frac: None, kind: str = "still") -> tuple[dict, dict]:
     """Returns (bundle, report). Raises TrainingError with a user-facing message."""
-    progress("Preparing features", 0.02)
-    X, y, groups, measures, skipped = build_matrix(records)
+    moving = kind == "moving"
+    what = "moving" if moving else "still"
+    progress(f"Preparing {what}-sign features", 0.02)
+    X, y, groups, measures, skipped = build_matrix(records, kind)
     if len(X) == 0:
-        raise TrainingError("No samples yet. Record a few signs first.")
+        raise TrainingError(f"No {what} signs recorded yet.")
 
     counts = Counter(y.tolist())
     labels = sorted(counts)
     if len(labels) < MIN_SIGNS:
-        raise TrainingError("Record at least two different signs to train a model.")
-    short = [l for l in labels if counts[l] < MIN_SAMPLES_PER_SIGN]
+        raise TrainingError(f"Record at least two different {what} signs to train that model.")
+    need = MIN_CLIPS_PER_SIGN if moving else MIN_SAMPLES_PER_SIGN
+    short = [l for l in labels if counts[l] < need]
     if short:
-        raise TrainingError(
-            f"Each sign needs at least {MIN_SAMPLES_PER_SIGN} samples. Record more for: {', '.join(short)}."
-        )
+        unit = "repetitions" if moving else "samples"
+        raise TrainingError(f"Each {what} sign needs at least {need} {unit}. Record more for: {', '.join(short)}.")
 
     sessions_per_label = {l: len(set(groups[y == l].tolist())) for l in labels}
     min_sessions = min(sessions_per_label.values())
@@ -113,9 +130,23 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
         n_splits = min(5, min_sessions)
         cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
         method = "grouped"
+        unit = "repetition" if moving else "frame"
         method_text = (
             f"{n_splits}-fold cross-validation, holding out whole recordings. "
-            "Every frame is scored by a model that never saw its recording."
+            f"Every {unit} is scored by a model that never saw its recording."
+        )
+    elif moving:
+        n_splits = min(5, min(counts.values()))
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        method = "clips"
+        method_text = (
+            f"{n_splits}-fold cross-validation over individual repetitions. Each repetition is "
+            "a separate performance of the sign, so this is a fair test."
+        )
+        single = [l for l in labels if sessions_per_label[l] < 2]
+        warnings.append(
+            "Some moving signs were recorded in only one sitting (" + ", ".join(single) + "). "
+            "Record them again another time, or by another person, to check the model copes with variety."
         )
     else:
         n_splits = min(5, min(counts.values()))
@@ -132,7 +163,7 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
 
     results = []
     fitted = {}
-    cands = candidates()
+    cands = candidates(len(X), len(labels))
     n = len(cands)
     for i, (name, est) in enumerate(cands.items()):
         base = 0.05 + 0.85 * i / n
@@ -180,7 +211,7 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
     ]
 
     # Baseline: how the hand-written starter rules do on signs they know
-    known = [i for i, l in enumerate(y) if l in rules.LABELS]
+    known = [] if moving else [i for i, l in enumerate(y) if l in rules.LABELS]
     baseline = None
     if known:
         hits = sum(1 for i in known if rules.predict(measures[i])["label"] == y[i])
@@ -194,7 +225,10 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
         res.pop("_pred", None)
 
     trained_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    two_hand = int(np.sum(X[:, features.PER_HAND_DIM * 2 + 1] > 0))
+    if moving:
+        two_hand = int(np.sum(X[:, sequence.PER_HAND * 2 + 1] > 0))   # first frame, second hand present
+    else:
+        two_hand = int(np.sum(X[:, features.PER_HAND_DIM * 2 + 1] > 0))
     report = {
         "trained_at": trained_at,
         "best_model": best["name"],
@@ -214,14 +248,16 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
         },
         "baseline_rules": baseline,
         "warnings": warnings,
-        "feature_version": features.FEATURE_VERSION,
-        "feature_dim": features.FEATURE_DIM,
+        "kind": kind,
+        "feature_version": _feature_version(kind),
+        "feature_dim": sequence.CLIP_DIM if moving else features.FEATURE_DIM,
     }
     bundle = {
         "estimator": fitted[best["name"]],
         "name": best["name"],
         "labels": labels,
-        "feature_version": features.FEATURE_VERSION,
+        "kind": kind,
+        "feature_version": _feature_version(kind),
         "trained_at": trained_at,
         "accuracy": best["accuracy"],
     }
@@ -229,14 +265,19 @@ def train(records: list[dict], progress=lambda stage, frac: None) -> tuple[dict,
     return bundle, report
 
 
-class Recognizer:
-    """Holds the current trained model and answers predictions thread-safely."""
+def _feature_version(kind: str) -> str:
+    return f"seq{sequence.SEQ_VERSION}" if kind == "moving" else f"frame{features.FEATURE_VERSION}"
 
-    def __init__(self, model_dir: Path):
+
+class Recognizer:
+    """Holds one trained model (still or moving) and answers predictions thread-safely."""
+
+    def __init__(self, model_dir: Path, kind: str = "still"):
+        self.kind = kind
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.model_path = self.model_dir / "model.joblib"
-        self.report_path = self.model_dir / "report.json"
+        self.model_path = self.model_dir / f"model_{kind}.joblib"
+        self.report_path = self.model_dir / f"report_{kind}.json"
         self._bundle = None
         self._lock = threading.Lock()
         self.load_error = None
@@ -253,7 +294,7 @@ class Recognizer:
             self._bundle = None
             self.load_error = f"Saved model couldn't be loaded ({exc.__class__.__name__}). Train again."
             return
-        if bundle.get("feature_version") != features.FEATURE_VERSION:
+        if bundle.get("feature_version") != _feature_version(self.kind):
             self._bundle = None
             self.load_error = "Saved model was made with older feature code. Train again."
             return
@@ -283,7 +324,7 @@ class Recognizer:
         if not b:
             return None
         return {"name": b["name"], "labels": b["labels"], "trained_at": b["trained_at"],
-                "accuracy": b.get("accuracy")}
+                "accuracy": b.get("accuracy"), "kind": self.kind}
 
     def report(self) -> dict | None:
         if not self.report_path.exists():

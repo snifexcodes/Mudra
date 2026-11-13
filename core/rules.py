@@ -119,11 +119,15 @@ def score_all(m: HandMeasure) -> list[tuple[str, float]]:
     return scored
 
 
-def predict(measures: list[HandMeasure], min_score: float = 0.5) -> dict:
-    """Uses the primary hand only."""
+def predict(measures: list[HandMeasure], min_score: float = 0.5, allowed=None) -> dict:
+    """Uses the primary hand only. `allowed` limits which gestures can win."""
     if not measures:
         return {"label": None, "confidence": 0.0, "top": []}
     scored = score_all(measures[0])
+    if allowed is not None:
+        scored = [s for s in scored if s[0] in allowed]
+        if not scored:
+            return {"label": None, "confidence": 0.0, "top": []}
     best_label, best = scored[0]
     top = [{"label": l, "confidence": round(s, 3)} for l, s in scored[:3]]
     if best < min_score:

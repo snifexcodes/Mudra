@@ -1,9 +1,12 @@
-// Camera + MediaPipe Hand Landmarker, running entirely in the browser.
+// Camera + MediaPipe Hand Landmarker (and Pose Landmarker for the shoulders
+// and nose, so moving signs know where they are made), all in the browser.
 
 export class Tracker {
   constructor(video) {
     this.video = video;
     this.landmarker = null;
+    this.pose = null;
+    this.lastPose = null;
     this.stream = null;
     this.numHands = 1;
     this.last = null;
@@ -39,12 +42,28 @@ export class Tracker {
           minTrackingConfidence: 0.5,
         });
         this.delegate = delegate;
+        await this.loadPose(vision, fileset, assets.pose_model, delegate);
         return;
       } catch (e) {
         lastErr = e;
       }
     }
     throw new Error(`The hand model couldn't start: ${lastErr && lastErr.message ? lastErr.message : lastErr}`);
+  }
+
+  // Optional: without it, moving signs still work but don't know where the body is.
+  async loadPose(vision, fileset, modelPath, delegate) {
+    if (!modelPath || !vision.PoseLandmarker) return;
+    try {
+      this.pose = await vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: modelPath, delegate },
+        runningMode: "VIDEO",
+        numPoses: 1,
+      });
+    } catch (e) {
+      console.warn("Pose model unavailable; continuing with hands only", e);
+      this.pose = null;
+    }
   }
 
   async setNumHands(n) {
@@ -102,6 +121,8 @@ export class Tracker {
           this.last = this.landmarker.detectForVideo(v, now);
           fresh = true;
           this._frames++;
+          // the body moves slowly next to the hands: every other frame is plenty
+          if (this.pose && this._frames % 2 === 0) this.lastPose = this.pose.detectForVideo(v, now + 0.5);
         } catch (e) {
           console.warn("detectForVideo failed", e);
         }
@@ -111,7 +132,7 @@ export class Tracker {
         this._frames = 0;
         this._fpsSince = now;
       }
-      onFrame(this.last, now, fresh);
+      onFrame(this.last, now, fresh, this.lastPose);
     };
     this._raf = requestAnimationFrame(tick);
   }

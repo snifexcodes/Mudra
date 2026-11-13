@@ -113,10 +113,15 @@ DIST_KEYS = [
 ]
 
 
-def measure_hand(hand: dict) -> HandMeasure:
-    """hand = {"handed": "Left"|"Right", "lm": 21x3 image pts, "wlm": 21x3 world pts}."""
+def measure_hand(hand: dict, use_world: bool = True) -> HandMeasure:
+    """hand = {"handed": "Left"|"Right", "lm": 21x3 image pts, "wlm": 21x3 world pts}.
+
+    use_world=False measures the hand from image points only. Moving-sign
+    features use that, so clips imported from datasets without world
+    landmarks are measured the same way as live clips.
+    """
     handed = str(hand.get("handed") or "Right")
-    raw = hand.get("wlm") or hand.get("lm")
+    raw = (hand.get("wlm") or hand.get("lm")) if use_world else (hand.get("lm") or hand.get("wlm"))
     if raw is None:
         raise ValueError("hand has no landmarks")
     p = _as_points(raw).copy()

@@ -1,31 +1,60 @@
-// Train view: manage signs, record samples from the webcam, train the model.
+// Train view: manage a pack's signs, record them from the webcam, train.
+// Still signs: ~7 seconds of frames while you hold the hand shape.
+// Moving signs: a series of repetitions, one short clip each.
 
-import { api, newSessionId } from "./api.js";
+import { api, newSessionId, isNothing } from "./api.js";
 import { esc } from "./translate.js";
 
-const TARGET = 300;           // samples per sign that fills the row's bar
-const MIN_SAMPLES = 20;       // must match core/model.py MIN_SAMPLES_PER_SIGN
-const CAPTURE_EVERY_MS = 66;  // ~15 frames per second
+const TARGET = { still: 300, moving: 20 };   // fills the row's bar
+const MIN = { still: 20, moving: 5 };        // must match core/model.py
+const CAPTURE_EVERY_MS = 66;                 // ~15 frames per second
 const CAPTURE_RING = 628.3;
-const PENDING_KEY = "mudra.pendingSigns";
+const REP_MS = 2200;                         // one repetition of a moving sign
+const REST_MS = 900;
 
+const ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+const DIGITS = "0123456789".split("");
 const PRESETS = {
-  alphabet: "ABCDEFGHIKLMNOPQRSTUVWXY".split(""),
-  words: ["HELLO", "THANK YOU", "YES", "NO", "PLEASE", "SORRY", "GOOD", "I LOVE YOU", "HELP", "WATER"],
-  controls: ["SPACE", "DELETE"],
+  asl: [
+    { key: "alpha", label: "Alphabet A–Y (still)", signs: ALPHA.filter((c) => c !== "J" && c !== "Z"), kind: "still" },
+    { key: "jz", label: "J and Z (moving)", signs: ["J", "Z"], kind: "moving" },
+    { key: "starter", label: "Starter set", starter: true, kind: "still" },
+    { key: "words", label: "Common words (moving)", kind: "moving",
+      signs: ["HELLO", "THANK YOU", "PLEASE", "SORRY", "YES", "NO", "HELP", "WATER", "EAT", "MORE"] },
+  ],
+  isl: [
+    { key: "alpha", label: "Alphabet A–Z (two hands, still)", signs: ALPHA, kind: "still" },
+    { key: "digits", label: "Numbers 0–9 (still)", signs: DIGITS, kind: "still" },
+    { key: "words", label: "Common words (moving)", kind: "moving",
+      signs: ["NAMASTE", "THANK YOU", "SORRY", "PLEASE", "YES", "NO", "HELP", "WATER", "FOOD", "GOOD"] },
+  ],
+  bsl: [
+    { key: "alpha", label: "Alphabet A–Z (two hands, still)", signs: ALPHA, kind: "still" },
+    { key: "digits", label: "Numbers 0–9 (still)", signs: DIGITS, kind: "still" },
+    { key: "words", label: "Common words (moving)", kind: "moving",
+      signs: ["HELLO", "THANK YOU", "PLEASE", "SORRY", "YES", "NO", "HELP", "WATER", "TOILET", "GOOD"] },
+  ],
+  other: [
+    { key: "alpha", label: "Alphabet A–Z (still)", signs: ALPHA, kind: "still" },
+    { key: "digits", label: "Numbers 0–9 (still)", signs: DIGITS, kind: "still" },
+    { key: "words", label: "Common words (moving)", kind: "moving",
+      signs: ["HELLO", "THANK YOU", "PLEASE", "SORRY", "YES", "NO", "HELP", "WATER"] },
+  ],
 };
+const NOTHING = { key: "nothing", label: "Nothing (rest and random moves)", pairs: [["NO SIGN", "still"], ["NO SIGN MOVING", "moving"]] };
 
 export class Studio {
   constructor(els, settings, hooks) {
     this.els = els;
     this.settings = settings;
-    this.hooks = hooks;            // { toast(msg, action), onTrained(), starterLabels() }
-    this.signs = [];               // from the server
-    this.pending = loadPending();  // added but not recorded yet
+    this.hooks = hooks;  // { pack(), packInfo(), toast(msg, action), onTrained(msg), onPackChanged(info), cameraReady() }
+    this.signs = [];     // [{label, kind, samples, sessions}]
     this.selected = null;
-    this.rec = null;               // active recording state
+    this.rec = null;
     this.polling = null;
     this.confirmDelete = null;
+    this.newKind = "still";
+    this.outcome = null;
     this.bind();
   }
 
@@ -33,10 +62,16 @@ export class Studio {
     const e = this.els;
     e.addForm.addEventListener("submit", (ev) => {
       ev.preventDefault();
-      const name = e.newSign.value;
-      if (this.addSign(name)) e.newSign.value = "";
+      this.addSign(e.newSign.value, this.newKind).then((ok) => { if (ok) e.newSign.value = ""; });
     });
-    e.presets.forEach((b) => b.addEventListener("click", () => this.addPreset(b.dataset.preset)));
+    e.kindButtons.forEach((b) => b.addEventListener("click", () => {
+      this.newKind = b.dataset.kind;
+      e.kindButtons.forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    }));
+    e.presets.addEventListener("click", (ev) => {
+      const b = ev.target.closest("button[data-preset]");
+      if (b) this.addPreset(b.dataset.preset);
+    });
     e.record.addEventListener("click", () => this.startRecording());
     e.train.addEventListener("click", () => this.train());
     e.list.addEventListener("click", (ev) => this.onListClick(ev));
@@ -53,41 +88,79 @@ export class Studio {
     });
   }
 
-  setDataset(summary) {
-    if (this.total !== undefined && summary.total !== this.total) this.outcome = null;  // data changed
-    this.signs = summary.signs || [];
-    this.total = summary.total || 0;
-    this.last = summary.last;
-    const known = new Set(this.signs.map((s) => s.label));
-    this.pending = this.pending.filter((l) => !known.has(l));
-    savePending(this.pending);
+  presetList() {
+    const code = this.hooks.pack();
+    return [...(PRESETS[code] || PRESETS.other), NOTHING];
+  }
+
+  // Called when the pack changes or its data changes.
+  setPack(info, { keepSelection = false } = {}) {
+    const prevTotal = this.total;
+    const ds = info.dataset || { signs: [], total: 0 };
+    if (prevTotal !== undefined && ds.total !== prevTotal) this.outcome = null;
+    this.total = ds.total;
+    const rec = new Map(ds.signs.map((s) => [s.label, s]));
+    const kinds = info.sign_kinds || {};
+    const labels = new Set([...rec.keys(), ...Object.keys(kinds)]);
+    this.signs = [...labels].map((l) => rec.get(l) || { label: l, kind: kinds[l] || "still", samples: 0, sessions: 0 })
+      .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+    if (!keepSelection || !labels.has(this.selected)) this.selected = null;
+    this.els.presets.innerHTML = this.presetList()
+      .map((p) => `<button type="button" data-preset="${p.key}">${esc(p.label)}</button>`).join("");
+    if (this.els.presetsBox && (!keepSelection || prevTotal === undefined)) this.els.presetsBox.open = this.signs.length === 0;
+    this.els.packName.textContent = info.name;
     this.render();
   }
 
-  allSigns() {
-    const rows = this.signs.map((s) => ({ ...s }));
-    for (const l of this.pending) rows.push({ label: l, samples: 0, sessions: 0 });
-    return rows.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+  async refresh() {
+    const info = await api.pack(this.hooks.pack());
+    this.hooks.onPackChanged(info);
   }
 
-  addSign(raw, quiet = false) {
+  signKind(label) {
+    const s = this.signs.find((x) => x.label === label);
+    return s ? s.kind : null;
+  }
+
+  async addSign(raw, kind, quiet = false) {
     const name = String(raw || "").replace(/\s+/g, " ").trim().toUpperCase();
     if (!name) { if (!quiet) this.hooks.toast("Type a name for the sign first."); return false; }
-    if (name.length > 24) { this.hooks.toast("Keep sign names under 24 characters."); return false; }
-    if (/[<>"\\]/.test(name)) { this.hooks.toast('Sign names can\'t contain < > " or \\.'); return false; }
-    const exists = this.allSigns().some((s) => s.label === name);
-    if (!exists) { this.pending.push(name); savePending(this.pending); }
-    if (!quiet) this.select(name);
-    this.render();
-    return true;
+    try {
+      const res = await api.addSign(this.hooks.pack(), name, kind);
+      if (!quiet) {
+        this.hooks.onPackChanged(res.pack);
+        this.select(res.label);
+      }
+      return res;
+    } catch (e) {
+      this.hooks.toast(e.message);
+      return false;
+    }
   }
 
-  addPreset(key) {
-    const list = key === "starter" ? this.hooks.starterLabels() : PRESETS[key];
-    list.forEach((l) => this.addSign(l, true));
-    if (!this.selected) this.select(list[0]);
-    this.render();
-    if (key === "alphabet") this.hooks.toast("Added A–Z without J and Z: those letters need movement, which a single frame can't show.");
+  async addPreset(key) {
+    const p = this.presetList().find((x) => x.key === key);
+    if (!p) return;
+    let pairs;
+    if (p.pairs) pairs = p.pairs;
+    else if (p.starter) pairs = (this.hooks.packInfo().starter || []).map((s) => [s.label, "still"]);
+    else pairs = p.signs.map((s) => [s, p.kind]);
+    let last = null, skipped = 0;
+    for (const [label, kind] of pairs) {
+      const existing = this.signKind(label);
+      if (existing && existing !== kind) { skipped++; continue; }
+      const res = await this.addSign(label, kind, true);
+      if (res) last = res;
+    }
+    if (last) this.hooks.onPackChanged(last.pack);
+    if (!this.selected && pairs.length) this.select(pairs[0][0]);
+    if (key === "alpha" && this.hooks.pack() === "asl") {
+      this.hooks.toast("Added A–Y as still signs. J and Z move: add them with the J and Z preset.");
+    } else if (key === "nothing") {
+      this.hooks.toast("Record yourself resting and making random moves as NO SIGN. Mudra will learn to ignore them.");
+    } else if (skipped) {
+      this.hooks.toast(`${skipped} sign${skipped === 1 ? " was" : "s were"} skipped: they already exist with the other type.`);
+    }
   }
 
   select(label) {
@@ -123,17 +196,10 @@ export class Studio {
       done = true;
       const next = input.value.replace(/\s+/g, " ").trim().toUpperCase();
       if (!save || !next || next === label) { this.render(); return; }
-      if (this.pending.includes(label)) {
-        this.pending = this.pending.map((l) => (l === label ? next : l));
-        savePending(this.pending);
-        if (this.selected === label) this.selected = next;
-        this.render();
-        return;
-      }
       try {
-        const res = await api.rename(label, next);
+        const res = await api.rename(this.hooks.pack(), label, next);
         if (this.selected === label) this.selected = next;
-        this.setDataset(res.dataset);
+        this.hooks.onPackChanged(res.pack);
         this.hooks.toast(`Renamed ${label} to ${next}. Train again to use the new name.`);
       } catch (e) { this.hooks.toast(e.message); this.render(); }
     };
@@ -147,14 +213,7 @@ export class Studio {
 
   async deleteSign(label) {
     const sign = this.signs.find((s) => s.label === label);
-    if (!sign) {
-      this.pending = this.pending.filter((l) => l !== label);
-      savePending(this.pending);
-      if (this.selected === label) this.selected = null;
-      this.render();
-      return;
-    }
-    if (this.confirmDelete !== label) {
+    if (sign && sign.samples && this.confirmDelete !== label) {
       this.confirmDelete = label;
       this.render();
       clearTimeout(this._confirmTimer);
@@ -162,31 +221,33 @@ export class Studio {
       return;
     }
     try {
-      const res = await api.deleteLabel(label);
+      const res = await api.deleteSign(this.hooks.pack(), label);
       if (this.selected === label) this.selected = null;
       this.confirmDelete = null;
-      this.setDataset(res.dataset);
-      this.hooks.toast(`Deleted ${label} and its ${res.removed} samples.`);
+      this.hooks.onPackChanged(res.pack);
+      if (res.removed) this.hooks.toast(`Deleted ${label} and its ${res.removed} recordings.`);
     } catch (e) { this.hooks.toast(e.message); }
   }
 
   render() {
     const e = this.els;
-    const rows = this.allSigns();
+    const rows = this.signs;
     if (!rows.length) {
-      e.list.innerHTML = '<li class="empty-list">No signs yet. Type a name above, or quick-add a set. Then pick a sign and press Record.</li>';
+      e.list.innerHTML = '<li class="empty-list">No signs yet. Type a name above and choose Still or Moving, or quick-add a set. Then pick a sign and press Record.</li>';
     } else {
-      e.list.innerHTML = rows.map((s) => {
+      e.list.innerHTML = rows.map((s, idx) => {
         const sel = s.label === this.selected;
         const word = [...s.label].length > 1;
-        const pct = Math.min(100, (s.samples / TARGET) * 100);
+        const pct = Math.min(100, (s.samples / TARGET[s.kind]) * 100);
         const confirming = this.confirmDelete === s.label;
+        const unit = s.kind === "moving" ? "repetition" : "sample";
         const stats = s.samples
-          ? `${s.samples} samples, ${s.sessions} recording${s.sessions === 1 ? "" : "s"}`
+          ? `${s.samples} ${unit}${s.samples === 1 ? "" : "s"}, ${s.sessions} recording${s.sessions === 1 ? "" : "s"}`
           : "Not recorded yet";
-        return `<li class="sign-row" role="option" tabindex="${sel || (!this.selected && s === rows[0]) ? 0 : -1}" aria-selected="${sel}" data-label="${esc(s.label)}">
+        const focusable = sel || (!this.selected && idx === 0);
+        return `<li class="sign-row${isNothing(s.label) ? " nothing" : ""}" role="option" tabindex="${focusable ? 0 : -1}" aria-selected="${sel}" data-label="${esc(s.label)}">
           <div class="name${word ? " word" : ""}">${esc(s.label)}</div>
-          <div><div class="stats">${stats}</div><div class="bar"><i class="${s.samples < MIN_SAMPLES ? "low" : ""}" style="width:${pct}%"></i></div></div>
+          <div><div class="stats"><span class="kind ${s.kind}">${s.kind === "moving" ? "Moving" : "Still"}</span> ${stats}</div><div class="bar"><i class="${s.samples < MIN[s.kind] ? "low" : ""}" style="width:${pct}%"></i></div></div>
           <div class="row-actions">
             <button class="icon-btn" data-act="rename" aria-label="Rename ${esc(s.label)}" title="Rename"><svg><use href="#i-pen"/></svg></button>
             <button class="icon-btn ${confirming ? "danger-btn" : ""}" data-act="delete" aria-label="${confirming ? "Click again to delete" : "Delete"} ${esc(s.label)}" title="${confirming ? "Click again to delete" : "Delete"}"><svg><use href="#i-trash"/></svg></button>
@@ -195,37 +256,45 @@ export class Studio {
       }).join("");
     }
 
-    const ready = this.signs.filter((s) => s.samples >= MIN_SAMPLES);
-    const n = this.signs.length;
+    const recorded = rows.filter((s) => s.samples > 0);
+    const n = recorded.length;
     e.datasetLine.textContent = n
-      ? `${n} sign${n === 1 ? "" : "s"} recorded, ${this.total.toLocaleString()} samples in total.`
+      ? `${n} sign${n === 1 ? "" : "s"} recorded, ${this.total.toLocaleString()} recordings in total.`
       : "Add a sign, then record yourself making it.";
 
+    const groups = ["still", "moving"].map((k) => recorded.filter((s) => s.kind === k));
+    const ready = groups.map((g, i) => g.length >= 2 && g.every((s) => s.samples >= MIN[["still", "moving"][i]]));
     const training = this.polling !== null;
     if (!training && this.outcome) {
       e.trainNote.className = this.outcome.ok ? "note ok" : "note error";
       e.trainNote.textContent = this.outcome.message;
     } else if (!training) {
       e.trainNote.className = "note";
-      if (ready.length < 2) {
-        e.trainNote.textContent = `To train, record at least two signs with ${MIN_SAMPLES} or more samples each.`;
-      } else {
-        const short = this.signs.filter((s) => s.samples < MIN_SAMPLES).map((s) => s.label);
+      const short = recorded.filter((s) => s.samples < MIN[s.kind]).map((s) => s.label);
+      if (!ready[0] && !ready[1]) {
         e.trainNote.textContent = short.length
-          ? `Record more for ${short.join(", ")} first (at least ${MIN_SAMPLES} samples each).`
-          : `Ready to train on ${n} signs.`;
+          ? `Record more for ${short.slice(0, 6).join(", ")}${short.length > 6 ? "…" : ""} (still signs need ${MIN.still} samples, moving signs ${MIN.moving} repetitions).`
+          : "To train, record at least two still signs or two moving signs.";
+      } else {
+        const parts = [];
+        if (ready[0]) parts.push(`${groups[0].length} still`);
+        if (ready[1]) parts.push(`${groups[1].length} moving`);
+        e.trainNote.textContent = `Ready to train on ${parts.join(" and ")} signs.` + (short.length ? ` Not ready yet: ${short.slice(0, 4).join(", ")}.` : "");
       }
     }
-    const canTrain = ready.length >= 2 && ready.length === n;
-    e.train.disabled = training || !canTrain || !!this.rec;
+    e.train.disabled = training || !(ready[0] || ready[1]) || !!this.rec;
 
     const sel = this.selected;
+    const kind = sel ? this.signKind(sel) : null;
     e.record.disabled = !sel || !!this.rec || !this.hooks.cameraReady();
     e.recordText.textContent = sel ? `Record ${sel}` : "Record";
     if (!this.rec) {
-      e.recHint.innerHTML = sel
-        ? `Hold <b>${esc(sel)}</b> and move your hand a little while recording: closer, farther, slightly tilted. Press <b>R</b> to start.`
-        : "Pick a sign from your list, then press <b>R</b> to record.";
+      if (!sel) e.recHint.innerHTML = "Pick a sign from your list, then press <b>R</b> to record.";
+      else if (isNothing(sel)) e.recHint.innerHTML = kind === "moving"
+        ? "Make random movements that aren't signs: scratching, waving to stretch, reaching. Press <b>R</b> to start."
+        : "Rest your hands in view, or hold shapes that aren't signs. Press <b>R</b> to start.";
+      else if (kind === "moving") e.recHint.innerHTML = `Make <b>${esc(sel)}</b> once each time it says <b>Sign now</b>, ${this.settings.repsPerRecording} times. Rest your hands in between. Press <b>R</b> to start.`;
+      else e.recHint.innerHTML = `Hold <b>${esc(sel)}</b> and move your hand a little while recording: closer, farther, slightly tilted. Press <b>R</b> to start.`;
     }
   }
 
@@ -233,7 +302,11 @@ export class Studio {
   startRecording() {
     if (!this.selected || this.rec || !this.hooks.cameraReady()) return;
     const label = this.selected;
-    this.rec = { label, session: newSessionId(), frames: [], phase: "count", countFrom: performance.now(), lastCap: 0, lastHand: 0 };
+    const kind = this.signKind(label) || "still";
+    this.rec = {
+      label, kind, session: newSessionId(), frames: [], clips: [], rep: null,
+      phase: "count", countFrom: performance.now(), lastCap: 0,
+    };
     this.els.hud.hidden = false;
     this.els.capture.hidden = true;
     this.els.countBig.hidden = false;
@@ -242,7 +315,12 @@ export class Studio {
   }
 
   cancelRecording() {
-    if (!this.rec) return;
+    const r = this.rec;
+    if (!r) return;
+    if (r.kind === "moving" && r.clips.length >= 1) {   // keep finished repetitions
+      this.finish(false);
+      return;
+    }
     this.rec = null;
     this.els.hud.hidden = true;
     this.els.dock.hidden = false;
@@ -251,57 +329,98 @@ export class Studio {
   }
 
   // Called every animation frame while the Train view is open.
-  frame(hands, now) {
+  frame(hands, pose, now) {
     const r = this.rec;
     if (!r) return;
     const e = this.els;
     if (r.phase === "count") {
       const left = 3 - Math.floor((now - r.countFrom) / 1000);
       if (left <= 0) {
-        r.phase = "capture";
-        r.started = now;
         e.countBig.hidden = true;
         e.capture.hidden = false;
         e.captureLabel.textContent = r.label;
         e.captureLabel.className = "label" + ([...r.label].length > 1 ? " word" : "");
+        if (r.kind === "moving") this.beginRep(now);
+        else { r.phase = "capture"; r.started = now; }
       } else if (e.countBig.textContent !== String(left)) {
         e.countBig.textContent = String(left);
       }
       return;
     }
+    if (r.kind === "moving") { this.frameMoving(hands, pose, now); return; }
     if (r.phase !== "capture") return;
     const target = this.settings.samplesPerRecording;
-    if (hands.length) {
-      r.lastHand = now;
-      if (now - r.lastCap >= CAPTURE_EVERY_MS) {
-        r.lastCap = now;
-        r.frames.push({ hands });
-      }
+    if (hands.length && now - r.lastCap >= CAPTURE_EVERY_MS) {
+      r.lastCap = now;
+      r.frames.push({ hands });
     }
     const n = r.frames.length;
     e.captureFill.style.strokeDashoffset = String(CAPTURE_RING * (1 - n / target));
     e.captureN.textContent = `${n} of ${target}`;
     e.captureWarn.textContent = hands.length ? "" : "Show your hand";
     const timedOut = now - r.started > 30000;
-    if (n >= target || timedOut) this.finishRecording(timedOut);
+    if (n >= target || timedOut) this.finish(timedOut);
   }
 
-  async finishRecording(timedOut) {
+  beginRep(now) {
+    const r = this.rec;
+    r.phase = "rep";
+    r.rep = { start: now, frames: [] };
+    this.els.capture.classList.add("go");
+    this.els.captureWarn.textContent = "";
+  }
+
+  frameMoving(hands, pose, now) {
+    const r = this.rec, e = this.els;
+    const total = this.settings.repsPerRecording;
+    if (r.phase === "rep") {
+      if (hands.length && now - r.lastCap >= CAPTURE_EVERY_MS) {
+        r.lastCap = now;
+        r.rep.frames.push({ t: +((now - r.rep.start) / 1000).toFixed(3), hands, pose });
+      }
+      const frac = Math.min(1, (now - r.rep.start) / REP_MS);
+      e.captureFill.style.strokeDashoffset = String(CAPTURE_RING * (1 - frac));
+      e.captureN.textContent = `Sign now (${r.clips.length + 1} of ${total})`;
+      e.captureWarn.textContent = hands.length ? "" : "Show your hand";
+      if (frac >= 1) {
+        if (r.rep.frames.length >= 5) r.clips.push(r.rep.frames);
+        r.phase = "rest";
+        r.restFrom = now;
+        e.capture.classList.remove("go");
+        if (r.clips.length >= total) this.finish(false);
+      }
+    } else if (r.phase === "rest") {
+      const frac = Math.min(1, (now - r.restFrom) / REST_MS);
+      e.captureFill.style.strokeDashoffset = String(CAPTURE_RING * frac);
+      e.captureN.textContent = `Rest (${r.clips.length} of ${total} done)`;
+      if (frac >= 1) this.beginRep(now);
+    }
+  }
+
+  async finish(timedOut) {
     const r = this.rec;
     r.phase = "saving";
+    this.els.capture.classList.remove("go");
     this.els.captureN.textContent = "Saving…";
+    const code = this.hooks.pack();
     try {
-      if (r.frames.length < 10) throw new Error("Your hand wasn't visible long enough. Nothing was saved, try again.");
-      const res = await api.addSamples(r.label, r.session, r.frames);
-      this.setDataset(res.dataset);
-      const msg = `Saved ${res.added} samples for ${r.label}${timedOut ? " (stopped after 30 seconds)" : ""}.`;
+      let res;
+      if (r.kind === "moving") {
+        if (!r.clips.length) throw new Error("Your hand wasn't visible during the repetitions. Nothing was saved, try again.");
+        res = await api.addClips(code, r.label, r.session, r.clips);
+      } else {
+        if (r.frames.length < 10) throw new Error("Your hand wasn't visible long enough. Nothing was saved, try again.");
+        res = await api.addSamples(code, r.label, r.session, r.frames);
+      }
+      this.hooks.onPackChanged(res.pack);
+      const what = r.kind === "moving" ? `${res.added} repetitions` : `${res.added} samples`;
       const session = r.session;
-      this.hooks.toast(msg, {
+      this.hooks.toast(`Saved ${what} for ${r.label}${timedOut ? " (stopped after 30 seconds)" : ""}.`, {
         label: "Undo",
         run: async () => {
           try {
-            const out = await api.deleteSession(session);
-            this.setDataset(out.dataset);
+            const out = await api.deleteSession(code, session);
+            this.hooks.onPackChanged(out.pack);
             this.hooks.toast("Recording removed.");
           } catch (e) { this.hooks.toast(e.message); }
         },
@@ -319,7 +438,7 @@ export class Studio {
   // ---------- training ----------
   async train() {
     try {
-      await api.train();
+      await api.train(this.hooks.pack());
     } catch (err) {
       if (err.status !== 409) { this.hooks.toast(err.message); return; }
     }
@@ -345,16 +464,8 @@ export class Studio {
       e.progress.hidden = true;
       if (s.state === "done" || s.state === "error") this.outcome = { ok: s.state === "done", message: s.message };
       this.render();
-      if (s.state === "done") this.hooks.onTrained(s.message);
+      if (s.state === "done") this.hooks.onTrained(s.message, s.pack);
     }, 400);
     this.render();
   }
-}
-
-function loadPending() {
-  try { return JSON.parse(localStorage.getItem(PENDING_KEY) || "[]").filter((x) => typeof x === "string"); }
-  catch { return []; }
-}
-function savePending(list) {
-  try { localStorage.setItem(PENDING_KEY, JSON.stringify(list)); } catch { /* storage unavailable */ }
 }

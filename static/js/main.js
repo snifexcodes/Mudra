@@ -1,21 +1,29 @@
-// Mudra front end: wires the camera, the overlay and the three views together.
+// Mudra front end: wires the camera, the overlay, the sign-language packs and
+// the four views (Translate, Talk, Train, Results) together.
 
-import { api, packHands } from "./api.js";
+import { api, packHands, packPose } from "./api.js";
 import { Tracker } from "./tracker.js";
 import { Overlay, introAnimation } from "./render.js";
 import { Translator, esc } from "./translate.js";
 import { Studio } from "./studio.js";
+import { Talk } from "./talk.js";
 import { renderResults } from "./results.js";
+import { speak, voices } from "./speech.js";
 
 const $ = (id) => document.getElementById(id);
+const VIEWS = ["live", "talk", "train", "results"];
 const SETTINGS_KEY = "mudra.settings";
 const DEFAULTS = {
-  source: "model", holdMs: 900, minConf: 60, autoSpace: true, speak: false,
+  pack: "", source: "model", holdMs: 900, minConf: 60, autoSpace: true, speak: false,
   twoHands: false, trails: true, mirror: true, cameraId: "", samplesPerRecording: 100,
+  repsPerRecording: 10, voiceURI: "", rate: 1, listenLang: "",
 };
 
 const settings = loadSettings();
-const state = { view: "live", status: null, modelReady: false, cameraReady: false, injected: null };
+const state = {
+  view: "live", status: null, packs: [], pack: null, cameraReady: false, injected: null,
+  resultsKind: null,
+};
 
 const video = $("video");
 const tracker = new Tracker(video);
@@ -34,19 +42,35 @@ function toast(message, action) {
   }
   t.classList.add("on");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove("on"), action ? 7000 : 4200);
+  toastTimer = setTimeout(() => t.classList.remove("on"), action ? 7000 : 4600);
+}
+
+// ---------- speech ----------
+function say(text) {
+  return speak(text, { lang: (state.pack && state.pack.spoken) || "en", voiceURI: settings.voiceURI, rate: settings.rate });
+}
+
+// ---------- pack helpers ----------
+const packCode = () => (state.pack ? state.pack.code : settings.pack || "isl");
+const models = () => (state.pack && state.pack.models) || {};
+function effectiveSource() {
+  return settings.source === "model" && models().still ? "model" : "rules";
 }
 
 // ---------- views ----------
 const translator = new Translator(
   { bubble: $("bubble"), glyph: $("glyph"), meta: $("bubble-meta"), ringFill: $("ring-fill"), caption: $("caption"), hint: $("hint") },
   settings,
-  { source: effectiveSource, onPrediction: () => {}, toast }
+  {
+    pack: packCode, source: effectiveSource, hasMoving: () => !!models().moving,
+    speak: say, toast, onSpeakAll: (text) => talk.add("you", text, "signed"),
+  }
 );
 
 const studio = new Studio(
   {
-    addForm: $("add-form"), newSign: $("new-sign"), presets: [...document.querySelectorAll("[data-preset]")],
+    addForm: $("add-form"), newSign: $("new-sign"), kindButtons: [...document.querySelectorAll(".kind-pick [data-kind]")],
+    presets: $("presets"), presetsBox: $("presets-box"), packName: $("train-pack-name"),
     list: $("sign-list"), datasetLine: $("dataset-line"), trainNote: $("train-note"), progress: $("train-progress"),
     train: $("btn-train"), record: $("btn-record"), recordText: $("record-text"), recHint: $("rec-hint"),
     dock: $("rec-dock"), hud: $("rec-hud"), countBig: $("count-big"), capture: $("capture"),
@@ -54,86 +78,195 @@ const studio = new Studio(
   },
   settings,
   {
-    toast,
-    starterLabels: () => (state.status ? state.status.starter.map((s) => s.label) : []),
+    pack: packCode, packInfo: () => state.pack || {}, toast,
     cameraReady: () => state.cameraReady,
+    onPackChanged: (info) => applyPack(info, { keepSelection: true }),
     onTrained: async (msg) => {
-      await refreshStatus();
+      await loadPack(packCode(), { keepSelection: true });
       settings.source = "model";
       saveSettings();
-      syncSettingsUI();
+      syncSourceUI();
       toast(`${msg} Translate now uses your signs.`, { label: "See results", run: () => setView("results") });
     },
   }
 );
 
+const talk = new Talk(
+  {
+    cats: $("talk-cats"), board: $("talk-board"), edit: $("talk-edit"), log: $("talk-log"),
+    typeForm: $("talk-type"), typeInput: $("talk-input"), listen: $("talk-listen"), lang: $("talk-lang"),
+    listenNote: $("talk-listen-note"), clear: $("talk-clear"), show: $("talk-show"),
+    big: $("talk-big"), bigText: $("talk-big-text"),
+  },
+  settings,
+  { speak: say, toast, save: () => saveSettings() }
+);
+
 function setView(view) {
   state.view = view;
   document.body.dataset.view = view;
-  for (const v of ["live", "train", "results"]) $(`view-${v}`).hidden = v !== view;
+  for (const v of VIEWS) $(`view-${v}`).hidden = v !== view;
   document.querySelectorAll(".tab").forEach((t) => t.setAttribute("aria-selected", String(t.dataset.view === view)));
   if (view !== "train" && studio.rec) studio.cancelRecording();
+  if (view !== "talk") talk.stop();
   if (view === "train") studio.render();
   if (view === "results") loadResults();
+  if (view === "live") translator.reset();
   $("tooltip").classList.remove("on");
 }
 
 async function loadResults() {
   const root = $("results-inner");
-  let report = null;
-  try { report = await api.report(); } catch (e) { if (e.status !== 404) { toast(e.message); } }
-  renderResults(root, report, { onGoTrain: () => setView("train") });
+  let reports = null;
+  try { reports = await api.report(packCode()); } catch (e) { if (e.status !== 404) toast(e.message); }
+  state.resultsKind = renderResults(root, reports, {
+    onGoTrain: () => setView("train"), packName: state.pack ? state.pack.name : "", kind: state.resultsKind,
+  });
 }
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => setView(t.dataset.view)));
 
-// ---------- source of predictions ----------
-function effectiveSource() {
-  return settings.source === "model" && state.modelReady ? "model" : "rules";
+// ---------- packs ----------
+async function loadPack(code, opts = {}) {
+  const info = await api.pack(code);
+  applyPack(info, opts);
+  return info;
 }
 
+function applyPack(info, { keepSelection = false } = {}) {
+  const changed = !state.pack || state.pack.code !== info.code;
+  state.pack = info;
+  const i = state.packs.findIndex((p) => p.code === info.code);
+  const summary = { ...info, sign_count: (info.dataset ? info.dataset.signs.length : info.sign_count) };
+  if (i >= 0) state.packs[i] = { ...state.packs[i], ...summary }; else state.packs.push(summary);
+  if (changed) {
+    settings.pack = info.code;
+    if (settings.twoHands !== info.two_hands) {
+      settings.twoHands = info.two_hands;
+      tracker.setNumHands(info.two_hands ? 2 : 1).catch(() => {});
+    }
+    saveSettings();
+    translator.reset();
+    talk.setDefaultLanguage(info.spoken);
+    for (const err of Object.values(info.model_errors || {})) toast(err);
+  }
+  studio.setPack(info, { keepSelection: keepSelection && !changed });
+  syncSettingsUI();
+  renderPacks();
+  if (state.view === "results" && changed) loadResults();
+}
+
+function renderPacks() {
+  const list = $("pack-list");
+  list.innerHTML = state.packs.map((p) => {
+    const trained = Object.entries(p.models || {}).filter(([, v]) => v).map(([k]) => k);
+    const status = trained.length ? `Trained: ${trained.join(" and ")} signs` : (p.code === "asl" ? "Starter gestures, not trained" : "Not trained yet");
+    const sel = state.pack && p.code === state.pack.code;
+    return `<li><button type="button" class="pack-item" data-pack="${esc(p.code)}" aria-pressed="${sel}">
+        <span class="short">${esc(p.short)}</span>
+        <span class="info"><b>${esc(p.name)}</b><small>${esc(p.region || "")}${p.region ? ". " : ""}${p.sign_count || 0} signs. ${status}.</small></span>
+      </button>${p.builtin ? "" : `<button type="button" class="icon-btn" data-del-pack="${esc(p.code)}" aria-label="Delete ${esc(p.name)}" title="Delete"><svg><use href="#i-trash"/></svg></button>`}</li>`;
+  }).join("");
+  $("pack-export").href = api.exportUrl(packCode());
+  $("pack-export").setAttribute("download", `mudra-${packCode()}.zip`);
+}
+
+$("pack-list").addEventListener("click", async (ev) => {
+  const pick = ev.target.closest("[data-pack]");
+  const del = ev.target.closest("[data-del-pack]");
+  if (pick) {
+    try { await loadPack(pick.dataset.pack); toast(`Switched to ${state.pack.name}.`); }
+    catch (e) { toast(e.message); }
+  } else if (del) {
+    const code = del.dataset.delPack;
+    if (del.dataset.confirm !== "1") {
+      del.dataset.confirm = "1";
+      del.classList.add("danger-btn");
+      del.title = "Click again to delete this pack and all its recordings";
+      setTimeout(() => { del.dataset.confirm = ""; del.classList.remove("danger-btn"); }, 3500);
+      return;
+    }
+    try {
+      const out = await api.deletePack(code);
+      state.packs = out.packs;
+      if (packCode() === code) await loadPack("isl"); else renderPacks();
+      toast("Pack deleted.");
+    } catch (e) { toast(e.message); }
+  }
+});
+
+$("new-pack").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    const info = await api.createPack({
+      name: f.name.value, short: f.short.value, region: f.region.value,
+      spoken: f.spoken.value || "en", two_hands: f.two_hands.checked,
+    });
+    state.packs.push(info);
+    applyPack(info);
+    f.reset();
+    f.two_hands.checked = true;
+    toast(`Added ${info.name}. Open Train to add its signs.`);
+  } catch (e) { toast(e.message); }
+});
+
+$("pack-import").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  try {
+    const out = await api.importPack(file);
+    if (!out.merged) state.packs.push(out.pack);
+    applyPack(out.pack);
+    toast(out.merged
+      ? `Added ${out.added} new recordings to ${out.pack.name}. Train again to use them.`
+      : `Imported ${out.pack.name} with ${out.added} recordings. Train it to use them.`);
+  } catch (e) { toast(e.message); }
+});
+
+// ---------- source of predictions ----------
 function syncSourceUI() {
   const src = effectiveSource();
-  const chip = $("source-chip");
-  chip.classList.toggle("model", src === "model");
-  $("source-text").textContent = src === "model" ? "My model" : "Starter gestures";
-  const m = state.status && state.status.model;
-  chip.title = src === "model" && m ? `${m.name}, ${m.labels.length} signs. Change in Settings.` : "Change in Settings";
+  const p = state.pack;
+  const chip = $("pack-chip");
+  chip.classList.toggle("model", src === "model" || !!models().moving);
+  $("pack-short").textContent = p ? p.short : "…";
+  const starterCount = p && p.starter ? p.starter.length : 0;
+  $("source-text").textContent = src === "model" || models().moving ? "My model" : (starterCount ? "Starter gestures" : "Not trained");
+  chip.title = p ? `${p.name}. Click to choose another sign language.` : "Choose a sign language";
   document.querySelectorAll("[data-source]").forEach((b) => {
     b.setAttribute("aria-pressed", String(b.dataset.source === src));
-    if (b.dataset.source === "model") b.disabled = !state.modelReady;
+    if (b.dataset.source === "model") b.disabled = !models().still;
   });
-  $("source-help").textContent = state.modelReady
-    ? `Your model knows ${m.labels.length} signs (${m.name}, trained ${m.trained_at}).`
-    : "Train a model in the Train tab to use your own signs.";
+  const still = models().still;
+  $("source-help").textContent = still
+    ? `Your still-sign model knows ${still.labels.length} signs (${still.name}, trained ${still.trained_at}).`
+    : "Train still signs in the Train tab to use your own hand shapes.";
   renderGuide();
 }
 
 function renderGuide() {
-  const src = effectiveSource();
+  const p = state.pack;
+  if (!p) return;
   const list = $("guide-list");
-  if (src === "model" && state.status && state.status.model) {
-    $("guide-intro").textContent = "Your trained model knows these signs. Hold one steady until the ring fills to add it.";
-    list.innerHTML = state.status.model.labels.map((l) => {
-      const ctrl = l === "SPACE" ? "Adds a space" : l === "DELETE" ? "Deletes the last character" : "Your recorded sign";
-      return `<li><span class="g${[...l].length > 1 ? " word" : ""}">${esc(l)}</span><span class="d">${ctrl}</span></li>`;
-    }).join("");
-  } else if (state.status) {
-    $("guide-intro").textContent = "Starter gestures work without training. Hold one steady until the ring fills to add it. Lower your hand to add a space.";
-    list.innerHTML = state.status.starter.map((s) =>
-      `<li><span class="g${[...s.label].length > 1 ? " word" : ""}">${esc(s.label)}</span><span class="d">${esc(s.how)}</span></li>`
-    ).join("");
-  }
-}
-
-async function refreshStatus() {
-  const st = await api.status();
-  state.status = st;
-  state.modelReady = !!st.model;
-  studio.setDataset(st.dataset);
-  syncSourceUI();
-  if (st.training && st.training.state === "running") studio.watchTraining();
-  return st;
+  const rows = [];
+  const m = models();
+  const describe = (l, kind) => {
+    if (l === "SPACE") return "Adds a space";
+    if (l === "DELETE") return "Deletes the last character";
+    if (l.startsWith("NO SIGN")) return "Recognised, but never added";
+    return kind === "moving" ? "Your recorded moving sign" : "Your recorded still sign";
+  };
+  if (effectiveSource() === "model" && m.still) m.still.labels.forEach((l) => rows.push([l, describe(l, "still")]));
+  else (p.starter || []).forEach((s) => rows.push([s.label, s.how]));
+  if (m.moving) m.moving.labels.forEach((l) => rows.push([l, describe(l, "moving")]));
+  $("guide-title").textContent = `Signs I can read in ${p.short}`;
+  $("guide-intro").textContent = rows.length
+    ? "Hold a still sign until the ring fills. Make a moving sign once, then pause. Lower your hand to add a space."
+    : `${p.name} has no starter gestures and nothing trained yet. Open the Train tab to record signs.`;
+  list.innerHTML = rows.map(([l, d]) =>
+    `<li><span class="g${[...l].length > 1 ? " word" : ""}">${esc(l)}</span><span class="d">${esc(d)}</span></li>`).join("");
 }
 
 // ---------- drawers ----------
@@ -154,7 +287,7 @@ function closeDrawers() {
   if (lastFocus) { lastFocus.focus(); lastFocus = null; }
 }
 $("open-settings").addEventListener("click", () => openDrawer("settings"));
-$("source-chip").addEventListener("click", () => openDrawer("settings"));
+$("pack-chip").addEventListener("click", () => openDrawer("packs"));
 $("open-guide").addEventListener("click", () => openDrawer("guide"));
 $("scrim").addEventListener("click", closeDrawers);
 document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeDrawers));
@@ -172,6 +305,10 @@ function syncSettingsUI() {
   $("o-hold").textContent = `${(settings.holdMs / 1000).toFixed(1)} s`;
   $("s-conf").value = settings.minConf;
   $("o-conf").textContent = `${settings.minConf}%`;
+  $("s-reps").value = settings.repsPerRecording;
+  $("o-reps").textContent = String(settings.repsPerRecording);
+  $("s-rate").value = settings.rate;
+  $("o-rate").textContent = `${(+settings.rate).toFixed(1)}×`;
   $("s-autospace").checked = settings.autoSpace;
   $("s-speak").checked = settings.speak;
   $("s-twohands").checked = settings.twoHands;
@@ -181,8 +318,13 @@ function syncSettingsUI() {
   overlay.mirror = settings.mirror;
   syncSourceUI();
 }
-$("s-hold").addEventListener("input", (e) => { settings.holdMs = +e.target.value; saveSettings(); syncSettingsUI(); });
-$("s-conf").addEventListener("input", (e) => { settings.minConf = +e.target.value; saveSettings(); syncSettingsUI(); });
+const bindRange = (id, key, num = Number) => $(id).addEventListener("input", (e) => {
+  settings[key] = num(e.target.value); saveSettings(); syncSettingsUI();
+});
+bindRange("s-hold", "holdMs");
+bindRange("s-conf", "minConf");
+bindRange("s-reps", "repsPerRecording");
+bindRange("s-rate", "rate", parseFloat);
 $("s-autospace").addEventListener("change", (e) => { settings.autoSpace = e.target.checked; saveSettings(); });
 $("s-speak").addEventListener("change", (e) => { settings.speak = e.target.checked; saveSettings(); });
 $("s-trails").addEventListener("change", (e) => { settings.trails = e.target.checked; saveSettings(); });
@@ -199,6 +341,16 @@ $("s-camera").addEventListener("change", async (e) => {
   try { await tracker.startCamera(settings.cameraId); toast("Camera switched."); }
   catch (err) { toast(err.message); }
 });
+$("s-voice").addEventListener("change", (e) => { settings.voiceURI = e.target.value; saveSettings(); say("Hello"); });
+
+function listVoices() {
+  const all = voices();
+  const lang = ((state.pack && state.pack.spoken) || "en").split("-")[0];
+  const sorted = [...all].sort((a, b) => (b.lang.startsWith(lang) - a.lang.startsWith(lang)) || a.name.localeCompare(b.name));
+  $("s-voice").innerHTML = `<option value="">Automatic (${esc((state.pack && state.pack.spoken) || "en")})</option>` +
+    sorted.map((v) => `<option value="${esc(v.voiceURI)}" ${v.voiceURI === settings.voiceURI ? "selected" : ""}>${esc(v.name)} (${esc(v.lang)})</option>`).join("");
+}
+if ("speechSynthesis" in window) speechSynthesis.addEventListener("voiceschanged", listVoices);
 
 async function listCameras() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
@@ -218,6 +370,7 @@ $("btn-speak").addEventListener("click", () => translator.speakAll());
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (!$("talk-big").hidden) { $("talk-big").hidden = true; return; }
     if (document.querySelector(".drawer.open")) { closeDrawers(); return; }
     if (studio.rec) { studio.cancelRecording(); return; }
   }
@@ -225,7 +378,7 @@ document.addEventListener("keydown", (e) => {
   if (["input", "textarea", "select"].includes(tag) || e.ctrlKey || e.metaKey || e.altKey) return;
   if (!$("intro").hidden && !$("intro").classList.contains("leaving")) return;
   if (e.target.closest && e.target.closest("button") && (e.key === " " || e.key === "Enter")) return;
-  if (["1", "2", "3"].includes(e.key)) { setView(["live", "train", "results"][+e.key - 1]); return; }
+  if (["1", "2", "3", "4"].includes(e.key)) { setView(VIEWS[+e.key - 1]); return; }
   if (state.view === "live") {
     if (e.key === " ") { e.preventDefault(); translator.space(); }
     else if (e.key === "Backspace") { e.preventDefault(); translator.backspace(); }
@@ -237,13 +390,15 @@ document.addEventListener("keydown", (e) => {
 
 // ---------- main loop ----------
 let fpsShown = 0;
-function onFrame(result, now) {
-  if (state.injected) result = state.injected;
+function onFrame(result, now, fresh, poseResult) {
+  if (state.injected) { result = state.injected.hands; poseResult = state.injected.pose; }
   const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
   const hands = packHands(result, vw, vh, settings.twoHands ? 2 : 1);
-  overlay.draw(state.view === "results" ? null : result, now, { trails: settings.trails });
-  if (state.view === "live") translator.frame(result, hands, now, overlay);
-  if (state.view === "train") studio.frame(hands, now);
+  const pose = packPose(poseResult, vw, vh);
+  const drawable = state.view === "results" || state.view === "talk" ? null : result;
+  overlay.draw(drawable, now, { trails: settings.trails });
+  if (state.view === "live") translator.frame(result, hands, pose, now, overlay);
+  if (state.view === "train") studio.frame(hands, pose, now);
   if (now - fpsShown > 500) {
     fpsShown = now;
     $("fps").textContent = state.cameraReady && tracker.fps ? `${tracker.fps} fps` : "";
@@ -268,14 +423,18 @@ let loadPromise = null;
 async function boot() {
   syncSettingsUI();
   try {
-    await refreshStatus();
+    const st = await api.status();
+    state.status = st;
+    state.packs = st.packs;
+    const code = st.packs.some((p) => p.code === settings.pack) ? settings.pack : st.default;
+    await loadPack(code);
+    if (st.training && st.training.state === "running" && st.training.pack === code) studio.watchTraining();
   } catch (e) {
     introStatus(e.message, true);
     return;
   }
-  const st = state.status;
-  if (st.model_error) toast(st.model_error);
-  loadPromise = tracker.load(st.assets, settings.twoHands ? 2 : 1, (m) => introStatus(m))
+  listVoices();
+  loadPromise = tracker.load(state.status.assets, settings.twoHands ? 2 : 1, (m) => introStatus(m))
     .then(() => introStatus(""))
     .catch((e) => { introStatus(e.message, true); throw e; });
   loadPromise.catch(() => {});
@@ -306,9 +465,9 @@ $("btn-start").addEventListener("click", async () => {
 // Developer hook for testing the UI without a camera: open /?debug
 if (new URLSearchParams(location.search).has("debug")) {
   window.mudra = {
-    inject: (res) => { state.injected = res; },
+    inject: (hands, pose = null) => { state.injected = hands ? { hands, pose } : null; },
     skipIntro: () => { leaveIntro(); state.cameraReady = true; studio.render(); tracker.start(onFrame); },
-    translator, studio, setView, settings,
+    translator, studio, talk, setView, settings, state,
   };
 }
 

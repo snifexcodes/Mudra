@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from core.assets import CDN_BASE, MODEL_URL, VENDOR  # noqa: E402
+from core.assets import CDN_BASE, MODEL_URL, POSE_MODEL_URL, VENDOR  # noqa: E402
 
 FILES = {
     "vision_bundle.mjs": f"{CDN_BASE}/vision_bundle.mjs",
@@ -26,6 +26,7 @@ FILES = {
     "wasm/vision_wasm_nosimd_internal.js": f"{CDN_BASE}/wasm/vision_wasm_nosimd_internal.js",
     "wasm/vision_wasm_nosimd_internal.wasm": f"{CDN_BASE}/wasm/vision_wasm_nosimd_internal.wasm",
     "hand_landmarker.task": MODEL_URL,
+    "pose_landmarker_lite.task": POSE_MODEL_URL,
 }
 
 

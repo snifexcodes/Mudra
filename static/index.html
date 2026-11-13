@@ -21,6 +21,11 @@
     <symbol id="i-speak" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></symbol>
     <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
     <symbol id="i-pen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5M8 22h8"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9M7 14l5-5 5 5M4 3h16"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
     <symbol id="i-print" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></symbol>
   </defs>
 </svg>
@@ -42,12 +47,13 @@
   </div>
   <nav class="tabs" role="tablist" aria-label="Views">
     <button class="tab" role="tab" data-view="live" aria-selected="true">Translate</button>
+    <button class="tab" role="tab" data-view="talk" aria-selected="false">Talk</button>
     <button class="tab" role="tab" data-view="train" aria-selected="false">Train</button>
     <button class="tab" role="tab" data-view="results" aria-selected="false">Results</button>
   </nav>
   <div class="top-right">
     <span class="fps" id="fps" title="Hand tracking speed"></span>
-    <button class="chip" id="source-chip" title="Change in settings"><span class="dot"></span><span id="source-text">Starter gestures</span></button>
+    <button class="chip pack-chip" id="pack-chip" title="Choose a sign language"><svg aria-hidden="true"><use href="#i-globe"/></svg><b id="pack-short">ISL</b><span id="source-text">Starter gestures</span></button>
     <button class="icon-btn" id="open-guide" aria-label="Signs I can read" title="Signs I can read"><svg><use href="#i-hand"/></svg></button>
     <button class="icon-btn" id="open-settings" aria-label="Settings" title="Settings"><svg><use href="#i-gear"/></svg></button>
   </div>
@@ -77,11 +83,47 @@
   </div>
 </section>
 
+<!-- Talk -->
+<section class="view" id="view-talk" aria-label="Talk" hidden>
+  <div class="talk">
+    <div class="talk-board">
+      <div class="talk-head">
+        <h2>Say it</h2>
+        <button class="ghost" id="talk-edit" aria-pressed="false">Edit phrases</button>
+      </div>
+      <div class="cats" id="talk-cats" role="tablist" aria-label="Phrase groups"></div>
+      <div class="phrases" id="talk-board"></div>
+    </div>
+    <div class="talk-convo">
+      <div class="talk-head">
+        <h2>Conversation</h2>
+        <div class="talk-tools">
+          <button class="ghost" id="talk-show"><svg><use href="#i-expand"/></svg>Show big</button>
+          <button class="ghost" id="talk-clear"><svg><use href="#i-trash"/></svg>Clear</button>
+        </div>
+      </div>
+      <div class="log" id="talk-log" aria-live="polite"></div>
+      <form class="type-row" id="talk-type" autocomplete="off">
+        <label class="sr-only" for="talk-input">Type something to say</label>
+        <input class="field" id="talk-input" placeholder="Type something to say, in any language">
+        <button class="primary" type="submit"><svg><use href="#i-speak"/></svg>Speak</button>
+      </form>
+      <div class="listen-row">
+        <button class="listen" id="talk-listen" type="button"><svg><use href="#i-mic"/></svg><span>Listen to them</span></button>
+        <label class="sr-only" for="talk-lang">Language they speak</label>
+        <select id="talk-lang" class="field"></select>
+      </div>
+      <p class="help" id="talk-listen-note">Chrome and Edge send the audio to Google or Microsoft to turn it into text.</p>
+    </div>
+  </div>
+</section>
+
 <!-- Train -->
 <section class="view" id="view-train" aria-label="Train" hidden>
   <div class="panel">
     <div class="panel-head">
       <h2>Your signs</h2>
+      <p class="pack-line" id="train-pack-name">Indian Sign Language</p>
       <p id="dataset-line">Add a sign, then record yourself making it.</p>
     </div>
     <form class="add-form" id="add-form" autocomplete="off">
@@ -89,13 +131,14 @@
       <input class="field" id="new-sign" maxlength="24" placeholder="Sign name, like A or THANK YOU">
       <button type="submit">Add</button>
     </form>
-    <div class="presets">
-      <span>Quick add</span>
-      <button type="button" data-preset="alphabet">Alphabet A–Z</button>
-      <button type="button" data-preset="starter">Starter set</button>
-      <button type="button" data-preset="words">Common words</button>
-      <button type="button" data-preset="controls">SPACE and DELETE</button>
+    <div class="kind-pick" role="group" aria-label="Sign type">
+      <button type="button" data-kind="still" aria-pressed="true">Still <small>hand shape held</small></button>
+      <button type="button" data-kind="moving" aria-pressed="false">Moving <small>sign with motion</small></button>
     </div>
+    <details class="presets-box" id="presets-box" open>
+      <summary>Quick add a set of signs</summary>
+      <div class="presets" id="presets"></div>
+    </details>
     <ul class="sign-list" id="sign-list" role="listbox" aria-label="Signs"></ul>
     <div class="panel-foot">
       <p class="note" id="train-note"></p>
@@ -121,6 +164,8 @@
 <section class="view" id="view-results" aria-label="Results" hidden>
   <div class="results"><div class="results-inner" id="results-inner"></div></div>
 </section>
+
+<div class="big-text" id="talk-big" hidden role="dialog" aria-label="Message shown large"><p id="talk-big-text"></p><span class="help">Tap anywhere to close</span></div>
 
 <div class="scrim" id="scrim" hidden></div>
 
@@ -164,9 +209,42 @@
       <label for="s-mirror">Mirror the camera <input type="checkbox" role="switch" class="switch" id="s-mirror"></label>
     </div>
     <div class="setting">
+      <label for="s-reps">Repetitions per moving-sign recording <output id="o-reps"></output></label>
+      <input type="range" id="s-reps" min="5" max="20" step="1">
+    </div>
+    <div class="setting">
+      <label for="s-voice">Voice</label>
+      <select id="s-voice"></select>
+      <label for="s-rate" style="margin-top:12px">Speaking speed <output id="o-rate"></output></label>
+      <input type="range" id="s-rate" min="0.6" max="1.6" step="0.1">
+    </div>
+    <div class="setting">
       <label for="s-camera">Camera</label>
       <select id="s-camera"></select>
     </div>
+  </div>
+</aside>
+
+<aside class="drawer" id="packs" aria-label="Sign languages" aria-hidden="true">
+  <div class="drawer-head"><h2>Sign language</h2><button class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button></div>
+  <div class="drawer-body">
+    <p class="help">Each sign language keeps its own signs and models. Share a pack as a file so others can import it and add their own recordings.</p>
+    <ul class="pack-list" id="pack-list"></ul>
+    <div class="pack-actions">
+      <a class="ghost" id="pack-export" href="#" download><svg><use href="#i-down"/></svg>Export this pack</a>
+      <label class="ghost file-btn"><svg><use href="#i-up"/></svg>Import a pack<input type="file" id="pack-import" accept=".zip" hidden></label>
+    </div>
+    <form class="new-pack" id="new-pack" autocomplete="off">
+      <h3>Add a sign language</h3>
+      <label>Name<input class="field" name="name" maxlength="60" placeholder="For example: Japanese Sign Language" required></label>
+      <div class="two-col">
+        <label>Short name<input class="field" name="short" maxlength="8" placeholder="JSL"></label>
+        <label>Spoken language<input class="field" name="spoken" maxlength="20" placeholder="ja-JP"></label>
+      </div>
+      <label>Country or region<input class="field" name="region" maxlength="60" placeholder="Japan"></label>
+      <label class="check"><input type="checkbox" name="two_hands" checked> Uses two-handed signs</label>
+      <button class="primary" type="submit">Add sign language</button>
+    </form>
   </div>
 </aside>
 
@@ -179,7 +257,7 @@
   <canvas id="intro-canvas" aria-hidden="true"></canvas>
   <div class="intro-content">
     <h1>Mudra</h1>
-    <p class="lede">Sign in front of your camera and watch your hands become text.</p>
+    <p class="lede">Sign in front of your camera and watch your hands become text and speech.</p>
     <button class="primary" id="btn-start">Start camera</button>
     <p class="status" id="intro-status" role="status"></p>
     <p class="fine">Video stays in this browser. Only the 21 points of each hand are sent to the Mudra server running on this computer.</p>
