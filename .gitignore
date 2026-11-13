@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+static/vendor/mediapipe/
+data/*.jsonl
+data/*.tmp
+models/*.joblib
+models/report.json

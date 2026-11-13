@@ -1,0 +1,4 @@
+# Only for the optional desktop demo (cv_demo.py)
+-r requirements.txt
+opencv-python>=4.8
+mediapipe>=0.10.14
