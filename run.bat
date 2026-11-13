@@ -4,9 +4,9 @@ if not exist .venv (
   echo Creating virtual environment...
   python -m venv .venv || goto :nopython
 )
-call .venv\Scripts\activate.bat
-pip install -q -r requirements.txt
-python app.py
+rem "python -m pip" instead of pip.exe: Smart App Control blocks the unsigned pip.exe launcher
+.venv\Scripts\python.exe -m pip install -q -r requirements.txt
+.venv\Scripts\python.exe app.py
 pause
 goto :eof
 :nopython
